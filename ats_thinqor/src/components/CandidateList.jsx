@@ -1,43 +1,27 @@
 import React, { useEffect, useState } from "react";
+import { useSelector, useDispatch } from "react-redux";
 import { useNavigate } from "react-router-dom";
 
-const API_BASE = "http://localhost:5000";
+import { fetchCandidates, fetchRequirements } from "../auth/authSlice";
 
 export default function CandidateList() {
-  const [candidates, setCandidates] = useState([]);
-  const [requirements, setRequirements] = useState([]);
-  const [selectedReq, setSelectedReq] = useState("");
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState("");
+  const dispatch = useDispatch();
   const navigate = useNavigate();
+  // Use Redux state
+  const { candidates, requirements, loading, error } = useSelector((state) => state.auth);
+
+  const [selectedReq, setSelectedReq] = useState("");
+  // Local error state can be removed if relying on Redux error, or kept for specific UI handling
+  // const [error, setError] = useState(""); 
 
   useEffect(() => {
-    loadCandidates();
-    loadRequirements();
-  }, []);
+    dispatch(fetchCandidates());
+    dispatch(fetchRequirements());
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dispatch]);
 
-  const loadCandidates = async () => {
-    try {
-      const res = await fetch(`${API_BASE}/get-candidates?user_role=ADMIN`);
-      const data = await res.json();
-      setCandidates(Array.isArray(data) ? data : []);
-    } catch (err) {
-      console.error("Error loading candidates:", err);
-      setError("Failed to load candidates.");
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const loadRequirements = async () => {
-    try {
-      const res = await fetch(`${API_BASE}/get-requirements`);
-      const data = await res.json();
-      setRequirements(Array.isArray(data) ? data : []);
-    } catch (err) {
-      console.error("Error loading requirements:", err);
-    }
-  };
+  // loadCandidates removed
+  // loadRequirements removed
 
   const navigateToTracking = (candidateId) => {
     if (!selectedReq) {

@@ -1,6 +1,6 @@
-from flask import Flask, request, jsonify
-import mysql.connector
-from mysql.connector import Error
+from flask import Flask, request, jsonify, send_from_directory
+import pymysql
+from pymysql.err import Error, IntegrityError
 from flask_cors import CORS
 import uuid
 import os
@@ -10,6 +10,8 @@ from pathlib import Path
 from werkzeug.utils import secure_filename
 from utils.event_notifier import notify_event
 from utils.auth import get_current_user
+from utils.db import get_db_connection, db_config
+from controllers.reports_controller import reports_bp
 try:
     from dotenv import load_dotenv
 except ImportError:
@@ -17,7 +19,8 @@ except ImportError:
 
 
 app = Flask(__name__)
-CORS(app)
+CORS(app, resources={r"/*": {"origins": ["http://localhost:5173", "http://127.0.0.1:5173"]}}, supports_credentials=True)
+app.register_blueprint(reports_bp)
 
 # -------------------------------------
 # Environment loading (.env preferred; fallback to config.env for local dev)
@@ -38,12 +41,7 @@ else:
 # -------------------------------------
 # Database connection configuration
 # -------------------------------------
-db_config = {
-    'host': os.getenv('DB_HOST', 'localhost'),
-    'user': os.getenv('DB_USER', 'root'),
-    'password': os.getenv('DB_PASSWORD', 'pujitha'),
-    'database': os.getenv('DB_NAME', 'ats_system')
-}
+# Moved to utils/db.py
 
 def initialize_database():
     """Create tables if they do not exist."""
@@ -67,9 +65,16 @@ def initialize_database():
                 role ENUM('ADMIN','DELIVERY_MANAGER','TEAM_LEAD','RECRUITER','CLIENT','CANDIDATE') DEFAULT 'RECRUITER',
                 phone VARCHAR(20),
                 status VARCHAR(20) DEFAULT 'ACTIVE',
+                session_token VARCHAR(255),
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """)
+
+        # Add session_token column if not exists
+        cursor.execute("SHOW COLUMNS FROM users LIKE 'session_token'")
+        if not cursor.fetchone():
+            print("⚠️ Adding 'session_token' column to users...")
+            cursor.execute("ALTER TABLE users ADD COLUMN session_token VARCHAR(255)")
 
         # ---------------------------
         # USERSDATA TABLE
@@ -102,6 +107,27 @@ def initialize_database():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """)
+        #----------------------------
+        #Interviewers TABLE
+        #----------------------------
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS interviews (
+                       id INT AUTO_INCREMENT PRIMARY KEY,
+                candidate_id INT NOT NULL,
+                requirement_id VARCHAR(64),
+                category VARCHAR(50),
+                stage VARCHAR(100),
+                date DATE,
+                time TIME,
+                duration VARCHAR(50),
+                mode VARCHAR(50),
+                location VARCHAR(255),
+                interviewer VARCHAR(255),
+                notes TEXT,
+                status VARCHAR(50),
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """)    
 
         # ---------------------------
         # REQUIREMENTS TABLE
@@ -118,6 +144,7 @@ def initialize_database():
                 ctc_range VARCHAR(100),
                 no_of_rounds INT DEFAULT 1,
                 status VARCHAR(50) DEFAULT 'OPEN',
+                amount INT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 created_by VARCHAR(100),
                 FOREIGN KEY (client_id) REFERENCES clients(id)
@@ -132,6 +159,16 @@ def initialize_database():
                 cursor.execute("ALTER TABLE requirements ADD COLUMN no_of_rounds INT DEFAULT 1")
             except Exception as e:
                 print(f"❌ Error adding no_of_rounds: {e}")
+
+
+        # Check for no_of_rounds column in requirements
+        cursor.execute("SHOW COLUMNS FROM requirements LIKE 'amount'")
+        if not cursor.fetchone():
+            print("⚠️ Adding 'amount' column to requirements...")
+            try:
+                cursor.execute("ALTER TABLE requirements ADD COLUMN amount INT")
+            except Exception as e:
+                print(f"❌ Error adding amount for requirements: {e}")        
 
         # ---------------------------
         # REQUIREMENT_ALLOCATIONS
@@ -149,6 +186,18 @@ def initialize_database():
                 FOREIGN KEY (assigned_by) REFERENCES users(id)
             );
         """)
+
+        # Migration check for requirement_allocations cols
+        cursor.execute("SHOW COLUMNS FROM requirement_allocations LIKE 'status'")
+        if not cursor.fetchone():
+            print("⚠️ Adding 'status' column to requirement_allocations...")
+            cursor.execute("ALTER TABLE requirement_allocations ADD COLUMN status VARCHAR(20) DEFAULT 'ASSIGNED'")
+        
+        cursor.execute("SHOW COLUMNS FROM requirement_allocations LIKE 'created_at'")
+        if not cursor.fetchone():
+            print("⚠️ Adding 'created_at' column to requirement_allocations...")
+            cursor.execute("ALTER TABLE requirement_allocations ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+        conn.commit()
 
         # ---------------------------
         # CANDIDATES TABLE
@@ -201,8 +250,10 @@ def initialize_database():
                     requirement_id VARCHAR(50),
                     stage_id BIGINT,
                     stage_name VARCHAR(255),
-                    status ENUM('PENDING','IN_PROGRESS','COMPLETED','REJECTED') DEFAULT 'PENDING',
+                    status ENUM('PENDING','IN_PROGRESS','COMPLETED','REJECTED','REVIEW_REQUIRED') DEFAULT 'PENDING',
                     decision ENUM('NONE','MOVE_NEXT','HOLD','REJECT') DEFAULT 'NONE',
+                    manual_decision ENUM('NONE','MOVE_NEXT','HOLD','REJECT') DEFAULT 'NONE',
+                    category VARCHAR(50),
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
                     UNIQUE KEY uniq_progress_stage (candidate_id, requirement_id, stage_id),
                     FOREIGN KEY (candidate_id) REFERENCES candidates(id),
@@ -239,6 +290,22 @@ def initialize_database():
                 except Exception as e:
                     print(f"   ❌ Error adding decision: {e}")
 
+            cursor.execute("SHOW COLUMNS FROM candidate_progress LIKE 'manual_decision'")
+            if not cursor.fetchone():
+                print("   -> Adding 'manual_decision' column...")
+                try:
+                    cursor.execute("ALTER TABLE candidate_progress ADD COLUMN manual_decision ENUM('NONE','MOVE_NEXT','HOLD','REJECT') DEFAULT 'NONE'")
+                except Exception as e:
+                    print(f"   ❌ Error adding manual_decision: {e}")
+
+            cursor.execute("SHOW COLUMNS FROM candidate_progress LIKE 'category'")
+            if not cursor.fetchone():
+                print("   -> Adding 'category' column...")
+                try:
+                    cursor.execute("ALTER TABLE candidate_progress ADD COLUMN category VARCHAR(50)")
+                except Exception as e:
+                    print(f"   ❌ Error adding category: {e}")
+
             # Fix Unique Key for candidate_progress
             print("   -> Checking unique key constraints...")
             try:
@@ -271,6 +338,33 @@ def initialize_database():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (candidate_id) REFERENCES candidates(id),
                 FOREIGN KEY (requirement_id) REFERENCES requirements(id)
+            );
+        """)
+
+        # ---------------- ASSESSMENT QUEUE ----------------
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS assesment_queue (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                candidate_id INT NOT NULL,
+                requirement_id VARCHAR(64) NOT NULL,
+                status VARCHAR(32) DEFAULT 'PENDING',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (candidate_id) REFERENCES candidates(id),
+                FOREIGN KEY (requirement_id) REFERENCES requirements(id)
+            );
+        """)
+
+        # ---------------- INTERACTION LOGS (AVATAR) ----------------
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS interaction_logs (
+                id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                session_id VARCHAR(64),
+                user_id INT,
+                user_role VARCHAR(50),
+                message_in TEXT,
+                message_out TEXT,
+                emotion VARCHAR(32),
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """)
 
@@ -318,15 +412,7 @@ def get_allowed_roles():
 # -------------------------------------
 # Create a reusable connection function
 # -------------------------------------
-def get_db_connection():
-    try:
-        connection = mysql.connector.connect(**db_config)
-        if connection.is_connected():
-            print("✅ MySQL Database connected successfully!")
-            return connection
-    except Error as e:
-        print("❌ Database connection failed:", e)
-        return None
+# Moved to utils/db.py
 
 # -------------------------------------
 # Routes
@@ -652,7 +738,6 @@ def get_users():
 
         cursor = conn.cursor(dictionary=True)
 
-        # Fetch users with fallback to usersdata
         cursor.execute("""
             SELECT 
                 u.id,
@@ -661,13 +746,32 @@ def get_users():
                 COALESCE(u.phone, ud.phone) AS phone,
                 u.role,
                 COALESCE(u.status, 'ACTIVE') AS status,
-                u.created_at
+                u.created_at,
+                'REGISTERED' as account_type
             FROM users u
             LEFT JOIN usersdata ud ON ud.email = u.email
-            ORDER BY u.created_at DESC
+
+            UNION ALL
+
+            SELECT 
+                ud.id,
+                ud.name,
+                ud.email,
+                ud.phone,
+                ud.role,
+                'PENDING' as status,
+                ud.created_at,
+                'INVITED' as account_type
+            FROM usersdata ud
+            WHERE ud.email NOT IN (SELECT email FROM users)
+            ORDER BY created_at DESC
         """)
 
         users = cursor.fetchall()
+        
+        # Handle ID conflicts for frontend (optional, but good practice)
+        # We can prefix IDs or just rely on react keys being smart enough or using email as key
+        # For now, we return as is.
 
         cursor.close()
         conn.close()
@@ -728,6 +832,39 @@ def create_user():
                 "message": f"Invalid role. Allowed roles: {', '.join(allowed_roles)}"
             }), 400
 
+        # --- VALIDATION: Email Format ---
+        email_regex = r'^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$'
+        if not re.match(email_regex, email):
+            return jsonify({"message": "Invalid email address format"}), 400
+
+        # --- VALIDATION: Phone Number ---
+        # 10 to 15 digits, no alphabets
+        if not re.match(r'^\d{10,15}$', str(phone)):
+             return jsonify({"message": "Invalid phone number. Must be 10-15 digits only."}), 400
+
+        # --- VALIDATION: Name Format ---
+        # No special chars like %, &, etc. Allow alphabets, spaces, dots, hyphens.
+        if not re.match(r"^[a-zA-Z\s\.\-]+$", name):
+             return jsonify({"message": "Invalid name format. Only alphabets, spaces, dots and hyphens allowed."}), 400
+
+        # --- VALIDATION: Password Strength ---
+        # Min 8 chars, at least 1 letter, 1 number
+        if len(password) < 8:
+            return jsonify({"message": "Password must be at least 8 characters long"}), 400
+        if (
+            not re.search(r"[A-Z]", password) or      # capital letter
+            not re.search(r"[a-z]", password) or      # small letter
+            not re.search(r"\d", password) or         # numeric
+            not re.search(r"[^A-Za-z0-9]", password)  # special character
+            ):
+            return jsonify({
+                "message": (
+                    "Password format is incomplete. "
+                    "It must contain at least one capital letter, "
+                    "one small letter, one numeric character, "
+                    "and one special character."
+                )
+    }), 400
         # Hash the password
         password_hash = hashlib.sha256(password.encode()).hexdigest()
 
@@ -746,7 +883,7 @@ def create_user():
 
         return jsonify({"message": f"✅ User '{name}' created successfully!"}), 201
 
-    except mysql.connector.IntegrityError:
+    except IntegrityError:
         return jsonify({"message": "⚠️ Email already exists!"}), 409
     except Exception as e:
         return jsonify({"message": "❌ Error creating user", "error": str(e)}), 500
@@ -932,7 +1069,7 @@ def login():
         conn = get_db_connection()
         cursor = conn.cursor(dictionary=True)
 
-        # Search in 'users' table (registered users)
+        # Search in 'users' table
         cursor.execute("""
             SELECT 
                 u.id, 
@@ -949,15 +1086,78 @@ def login():
         """, (email, hashed_pw))
         user = cursor.fetchone()
 
-        cursor.close()
-        conn.close()
         if user:
+            # Generate Session Token
+            token = str(uuid.uuid4())
+            
+            # Store token in DB
+            cursor.execute("UPDATE users SET session_token = %s WHERE id = %s", (token, user['id']))
+            conn.commit()
+            
+            # Attach token to response user object
+            user['token'] = token
+            
+            cursor.close()
+            conn.close()
             return jsonify({"message": "✅ Login successful", "user": user}), 200
         else:
+            cursor.close()
+            conn.close()
             return jsonify({"message": "❌ Invalid email or password"}), 401
 
     except Exception as e:
         return jsonify({"message": "❌ Error during login", "error": str(e)}), 500
+
+
+@app.route('/verify-session', methods=['POST'])
+def verify_session():
+    try:
+        data = request.get_json()
+        token = data.get('token')
+        
+        if not token:
+            return jsonify({"valid": False, "message": "No token provided"}), 401
+
+        conn = get_db_connection()
+        cursor = conn.cursor(dictionary=True)
+        
+        cursor.execute("""
+            SELECT id, name, email, role, status 
+            FROM users 
+            WHERE session_token = %s AND status = 'ACTIVE'
+        """, (token,))
+        user = cursor.fetchone()
+        
+        cursor.close()
+        conn.close()
+        
+        if user:
+            user['token'] = token  # Ensure token is returned to persist in frontend
+            return jsonify({"valid": True, "user": user}), 200
+        else:
+            return jsonify({"valid": False, "message": "Invalid or expired session"}), 401
+            
+    except Exception as e:
+        return jsonify({"valid": False, "error": str(e)}), 500
+
+
+@app.route('/logout', methods=['POST'])
+def logout():
+    try:
+        data = request.get_json()
+        token = data.get('token')
+        
+        if token:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute("UPDATE users SET session_token = NULL WHERE session_token = %s", (token,))
+            conn.commit()
+            cursor.close()
+            conn.close()
+
+        return jsonify({"message": "Logged out successfully"}), 200
+    except Exception as e:
+        return jsonify({"message": "Error logging out", "error": str(e)}), 500
 
 
 @app.route('/signup', methods=['POST'])
@@ -977,8 +1177,14 @@ def signup():
         cursor = conn.cursor(dictionary=True)
 
         # 1️⃣ Check if email exists in usersdata table (created by admin)
+        print(f"🔍 Signup: Checking invalid/invite list for email '{email}'")
         cursor.execute("SELECT * FROM usersdata WHERE email = %s", (email,))
         existing_user = cursor.fetchone()
+        
+        if existing_user:
+             print(f"✅ Found invite for '{email}': {existing_user}")
+        else:
+             print(f"❌ No invite found for '{email}' in usersdata")
 
         if not existing_user:
             cursor.close()
@@ -1154,11 +1360,11 @@ def get_recruiters():
 @app.route("/requirements", methods=["POST"])
 def create_requirement():
     try:
-        data = request.get_json()
+        data = request.get_json() or {}
         req_id = str(uuid.uuid4())
 
         # Validate required fields
-        required_fields = ["client_id", "title", "location"]
+        required_fields = ["client_id", "title", "location", "description", "skills_required", "experience_required", "ctc_range"]
         missing = []
         for field in required_fields:
             value = data.get(field)
@@ -1212,6 +1418,14 @@ def create_requirement():
         except:
             no_of_rounds = 1
 
+        # Amount field (for billing)
+        try:
+            amount_value = float(data.get("amount", 0)) if data.get("amount") else 0
+            if amount_value < 0:
+                amount_value = 0
+        except (TypeError, ValueError):
+            amount_value = 0
+
         # Custom stage names (if provided)
         stage_names_list = data.get("stage_names", [])
         if not isinstance(stage_names_list, list):
@@ -1223,8 +1437,8 @@ def create_requirement():
         cursor.execute("""
             INSERT INTO requirements
             (id, client_id, title, description, location, skills_required, 
-             experience_required, ctc_range, no_of_rounds, status, created_by)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,'OPEN',%s)
+             experience_required, ctc_range, no_of_rounds, status, created_by, amount)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,'OPEN',%s,%s)
         """, (
             req_id,
             client_id_value,
@@ -1235,7 +1449,8 @@ def create_requirement():
             experience_value,
             ctc_range_value,
             no_of_rounds,
-            created_by_value
+            created_by_value,
+            amount_value
         ))
 
         # Generate Stages with custom names if provided
@@ -1282,10 +1497,11 @@ def create_requirement():
             "skills_required": skills_value,
             "experience_required": experience_value,
             "ctc_range": ctc_range_value,
+            "amount": amount_value,
             "no_of_rounds": no_of_rounds,
-            "created_by": user.get("name", "Unknown"),
-            "created_by_id": user.get("id"),
-            "created_by_role": user.get("role", "UNKNOWN"),
+            "created_by": user.get("name", "Unknown") if user else "Unknown",
+            "created_by_id": user.get("id") if user else None,
+            "created_by_role": user.get("role", "UNKNOWN") if user else "UNKNOWN",
             "created_at": str(datetime.now())
         })
 
@@ -1308,62 +1524,56 @@ def get_candidate_tracker(candidate_id):
         # The user said "after a candidate is screened... he should be visible in this track route".
         # So we should look for screening records too and maybe auto-initialize progress if missing.
 
-        # Let's just fetch requirements where we have progress OR screening
+        # Single Query to get requirements + stages + progress
+        # We join requirements with stages and then left join candidate_progress
         cursor.execute("""
-            SELECT DISTINCT r.id, r.title, r.client_id, c.name as client_name, r.no_of_rounds
+            SELECT 
+                r.id AS req_id, r.title, r.client_id, c.name AS client_name, r.no_of_rounds,
+                rs.id AS stage_id, rs.stage_order, rs.stage_name,
+                cp.status, cp.decision, cp.updated_at
             FROM requirements r
             LEFT JOIN clients c ON c.id = r.client_id
-            LEFT JOIN candidate_progress cp ON cp.requirement_id = r.id
-            LEFT JOIN candidate_screening cs ON cs.requirement_id = r.id
-            WHERE cp.candidate_id = %s OR cs.candidate_id = %s
-        """, (candidate_id, candidate_id))
+            JOIN requirement_stages rs ON rs.requirement_id = r.id
+            LEFT JOIN candidate_progress cp ON cp.stage_id = rs.id AND cp.candidate_id = %s
+            WHERE r.id IN (
+                SELECT DISTINCT requirement_id FROM candidate_progress WHERE candidate_id = %s
+                UNION
+                SELECT DISTINCT requirement_id FROM candidate_screening WHERE candidate_id = %s
+            )
+            ORDER BY r.created_at DESC, rs.stage_order ASC
+        """, (candidate_id, candidate_id, candidate_id))
         
-        requirements = cursor.fetchall()
+        rows = cursor.fetchall()
         
-        tracker_data = []
-        
-        for req in requirements:
-            req_id = req["id"]
+        # Organize data by requirement
+        tracker_map = {}
+        for row in rows:
+            rid = row["req_id"]
+            if rid not in tracker_map:
+                tracker_map[rid] = {
+                    "requirement": {
+                        "id": rid,
+                        "title": row["title"],
+                        "client_id": row["client_id"],
+                        "client_name": row["client_name"],
+                        "no_of_rounds": row["no_of_rounds"]
+                    },
+                    "stages": []
+                }
             
-            # Get Stages
-            cursor.execute("""
-                SELECT id, stage_order, stage_name 
-                FROM requirement_stages 
-                WHERE requirement_id = %s 
-                ORDER BY stage_order ASC
-            """, (req_id,))
-            stages = cursor.fetchall()
-            
-            # Get Progress for each stage
-            cursor.execute("""
-                SELECT stage_id, status, decision, updated_at
-                FROM candidate_progress
-                WHERE candidate_id = %s AND requirement_id = %s
-            """, (candidate_id, req_id))
-            progress_rows = cursor.fetchall()
-            progress_map = {row["stage_id"]: row for row in progress_rows}
-            
-            stages_with_status = []
-            for stage in stages:
-                p = progress_map.get(stage["id"], {})
-                stages_with_status.append({
-                    "stage_id": stage["id"],
-                    "stage_name": stage["stage_name"],
-                    "stage_order": stage["stage_order"],
-                    "status": p.get("status", "PENDING"),
-                    "decision": p.get("decision", "NONE"),
-                    "updated_at": p.get("updated_at")
-                })
-                
-            tracker_data.append({
-                "requirement": req,
-                "stages": stages_with_status
+            tracker_map[rid]["stages"].append({
+                "stage_id": row["stage_id"],
+                "stage_name": row["stage_name"],
+                "stage_order": row["stage_order"],
+                "status": row["status"] or "PENDING",
+                "decision": row["decision"] or "NONE",
+                "updated_at": row["updated_at"]
             })
             
         cursor.close()
         conn.close()
         
-        return jsonify(tracker_data), 200
+        return jsonify(list(tracker_map.values())), 200
         
     except Exception as e:
         print("❌ Error fetching tracker:", e)
@@ -1438,30 +1648,8 @@ def assign_requirement():
         conn = get_db_connection()
         cursor = conn.cursor()
 
-        # Ensure table exists with required columns
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS requirement_allocations (
-                id VARCHAR(64) PRIMARY KEY,
-                requirement_id VARCHAR(64) NOT NULL,
-                recruiter_id INT NOT NULL,
-                assigned_by INT NOT NULL,
-                status VARCHAR(20) DEFAULT 'ASSIGNED',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        conn.commit()
-
-        # Add status column if missing (legacy tables)
-        cursor.execute("SHOW COLUMNS FROM requirement_allocations LIKE 'status'")
-        if cursor.fetchone() is None:
-            cursor.execute("ALTER TABLE requirement_allocations ADD COLUMN status VARCHAR(20) DEFAULT 'ASSIGNED'")
-            conn.commit()
-
-        # Add created_at column if missing
-        cursor.execute("SHOW COLUMNS FROM requirement_allocations LIKE 'created_at'")
-        if cursor.fetchone() is None:
-            cursor.execute("ALTER TABLE requirement_allocations ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
-            conn.commit()
+        # No-op: Table creation/alteration moved to initialize_database() to avoid request-time latency.
+        pass
 
         # Validate recruiter
         cursor.execute("SELECT COUNT(*) FROM users WHERE id = %s", (recruiter_id,))
@@ -1665,13 +1853,45 @@ def delete_requirement(req_id):
         if not result:
             return jsonify({"error": "Requirement not found"}), 404
 
-        # Delete allocations related to this requirement
+        # Delete related records in the correct order (child tables first)
+        
+        # 1. Delete from candidate_progress (references requirement_id and stage_id)
+        cursor.execute(
+            "DELETE FROM candidate_progress WHERE requirement_id = %s",
+            (req_id,)
+        )
+        
+        # 2. Delete from candidate_screening (references requirement_id)
+        cursor.execute(
+            "DELETE FROM candidate_screening WHERE requirement_id = %s",
+            (req_id,)
+        )
+        
+        # 3. Delete from assesment_queue (references requirement_id)
+        cursor.execute(
+            "DELETE FROM assesment_queue WHERE requirement_id = %s",
+            (req_id,)
+        )
+        
+        # 4. Delete from interviews (references requirement_id)
+        cursor.execute(
+            "DELETE FROM interviews WHERE requirement_id = %s",
+            (req_id,)
+        )
+        
+        # 5. Delete from requirement_stages (references requirement_id)
+        cursor.execute(
+            "DELETE FROM requirement_stages WHERE requirement_id = %s",
+            (req_id,)
+        )
+        
+        # 6. Delete from requirement_allocations (references requirement_id)
         cursor.execute(
             "DELETE FROM requirement_allocations WHERE requirement_id = %s",
             (req_id,)
         )
 
-        # Delete requirement
+        # 7. Finally, delete the requirement itself
         cursor.execute(
             "DELETE FROM requirements WHERE id = %s",
             (req_id,)
@@ -1679,14 +1899,174 @@ def delete_requirement(req_id):
 
         conn.commit()
 
-        return jsonify({"message": "Requirement deleted successfully"}), 200
+        return jsonify({"message": "Requirement and all related records deleted successfully"}), 200
 
     except Exception as e:
+        conn.rollback()
+        print(f"❌ Error deleting requirement: {e}")
         return jsonify({"error": str(e)}), 500
 
     finally:
         cursor.close()
         conn.close()
+
+@app.route("/recent-requirements", methods=["GET"])
+def recent_requirements():
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor(dictionary=True)
+
+        # Ensure correct DB
+        cursor.execute("USE ats_system")
+
+        # Ensure table exists
+        cursor.execute("SHOW TABLES LIKE 'requirements'")
+        if not cursor.fetchone():
+            return jsonify([]), 200
+
+        # Fetch latest 5 requirements
+        cursor.execute("""
+            SELECT 
+                id,
+                title,
+                status,
+                DATE_FORMAT(created_at, '%Y-%m-%d %H:%i:%s') AS date
+            FROM requirements
+            ORDER BY created_at DESC
+            LIMIT 5
+        """)
+
+        rows = cursor.fetchall()
+
+        cursor.close()
+        conn.close()
+
+        return jsonify(rows), 200
+
+    except Exception as e:
+        print("❌ Error fetching recent requirements:", e)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/dashboard-stats', methods=['GET'])
+def dashboard_stats():
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor(dictionary=True)
+
+        # Use your database
+        cursor.execute("USE ats_system")
+
+        # Total requirements
+        cursor.execute("SELECT COUNT(*) AS total FROM requirements")
+        total = cursor.fetchone()['total'] or 0
+
+        # Open requirements
+        cursor.execute("SELECT COUNT(*) AS open_count FROM requirements WHERE status = 'Open'")
+        open_req = cursor.fetchone()['open_count'] or 0
+
+        # Closed requirements
+        cursor.execute("SELECT COUNT(*) AS closed_count FROM requirements WHERE status = 'Closed'")
+        closed_req = cursor.fetchone()['closed_count'] or 0
+
+        # Assigned requirements
+        cursor.execute("SELECT COUNT(*) AS assigned_count FROM requirement_allocations")
+        assigned_req = cursor.fetchone()['assigned_count'] or 0
+
+        # Urgent requirements (example: open and no_of_rounds > 5)
+        cursor.execute("SELECT COUNT(*) AS urgent_count FROM requirements WHERE status = 'Open' AND no_of_rounds > 5")
+        urgent_req = cursor.fetchone()['urgent_count'] or 0
+
+        # Pending review
+        cursor.execute("SELECT COUNT(*) AS pending_review FROM requirement_allocations WHERE status = 'Pending'")
+        pending_review = cursor.fetchone()['pending_review'] or 0
+
+        # Closed growth percent (closed this month / total)
+        start_of_month = datetime.utcnow().replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        cursor.execute(
+            "SELECT COUNT(*) AS closed_this_month FROM requirements "
+            "WHERE status = 'Closed' AND created_at >= %s",
+            (start_of_month,)
+        )
+        closed_this_month = cursor.fetchone()['closed_this_month'] or 0
+        closed_growth_percent = round((closed_this_month / total) * 100, 2) if total else 0
+
+        cursor.close()
+        conn.close()
+
+        stats = {
+            "totalRequirements": total,
+            "openRequirements": open_req,
+            "closedRequirements": closed_req,
+            "assignedRequirements": assigned_req,
+            "urgent": urgent_req,
+            "pendingReview": pending_review,
+            "closedGrowthPercent": closed_growth_percent
+        }
+
+        return jsonify({"stats": stats})
+
+    except Exception as e:
+        print("❌ Error fetching dashboard stats:", e)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/update-requirement/<req_id>", methods=["PUT"])
+def update_requirement(req_id):
+    data = request.json
+
+    conn = get_db_connection()
+    cursor = conn.cursor(dictionary=True)
+
+    cursor.execute("SELECT * FROM requirements WHERE id = %s", (req_id,))
+    row = cursor.fetchone()
+
+    if not row:
+        return jsonify({"error": "Requirement not found"}), 404
+
+    cursor = conn.cursor()  # non-dict cursor for update
+
+    # Handle amount field
+    try:
+        amount_value = float(data.get("amount", 0)) if data.get("amount") else 0
+        if amount_value < 0:
+            amount_value = 0
+    except (TypeError, ValueError):
+        amount_value = 0
+
+    cursor.execute("""
+        UPDATE requirements
+        SET title=%s, location=%s, experience_required=%s,
+            skills_required=%s, ctc_range=%s, client_id=%s, status=%s, description=%s, amount=%s
+        WHERE id=%s
+    """, (
+        data["title"],
+        data["location"],
+        data["experience_required"],
+        data["skills_required"],
+        data["ctc_range"],
+        data["client_id"],
+        data["status"],
+        data.get("description", ""),
+        amount_value,
+        req_id
+    ))
+
+    conn.commit()
+    cursor.close()
+    conn.close()
+    return jsonify({"message": "Requirement updated"})
+
+
+
+
+
+
+
+
+
+
+
 
 @app.route('/create-client', methods=['POST'])
 def create_client():
@@ -1772,32 +2152,60 @@ def update_client(id):
 
 
 # ---------------- DELETE CLIENT ----------------
-@app.route('/delete-client/<int:id>', methods=['DELETE'])
+# ---------------- DELETE CLIENT ----------------
+@app.route('/delete-client/<int:id>', methods=['DELETE', 'OPTIONS'])
 def delete_client(id):
+    if request.method == "OPTIONS":
+        return '', 200
+
     conn = get_db_connection()
     cursor = conn.cursor()
 
     try:
-        # 1️⃣ Check if this client is linked to any requirements
-        cursor.execute("SELECT COUNT(*) FROM requirements WHERE client_id = %s", (id,))
-        req_count = cursor.fetchone()[0]
+        # 1. Fetch all requirements for this client
+        cursor.execute("SELECT id FROM requirements WHERE client_id = %s", (id,))
+        reqs = cursor.fetchall()
+        req_ids = [r[0] for r in reqs]
 
-        if req_count > 0:
-            return jsonify({
-                "message": "Client cannot be deleted because it is used in one or more requirements."
-            }), 400
+        if req_ids:
+            # 2. Cascade delete linked data for these requirements
+            # We can use IN clause for efficiency
+            format_strings = ','.join(['%s'] * len(req_ids))
+            
+            # Delete from candidate_progress
+            cursor.execute(f"DELETE FROM candidate_progress WHERE requirement_id IN ({format_strings})", tuple(req_ids))
+            
+            # Delete from candidate_screening
+            cursor.execute(f"DELETE FROM candidate_screening WHERE requirement_id IN ({format_strings})", tuple(req_ids))
+            
+            # Delete from assesment_queue
+            cursor.execute(f"DELETE FROM assesment_queue WHERE requirement_id IN ({format_strings})", tuple(req_ids))
+            
+            # Delete from interviews
+            cursor.execute(f"DELETE FROM interviews WHERE requirement_id IN ({format_strings})", tuple(req_ids))
+            
+            # Delete from requirement_stages
+            cursor.execute(f"DELETE FROM requirement_stages WHERE requirement_id IN ({format_strings})", tuple(req_ids))
+            
+            # Delete from requirement_allocations
+            cursor.execute(f"DELETE FROM requirement_allocations WHERE requirement_id IN ({format_strings})", tuple(req_ids))
 
-        # 2️⃣ Safe to delete client
+            # Delete the requirements themselves
+            cursor.execute(f"DELETE FROM requirements WHERE id IN ({format_strings})", tuple(req_ids))
+
+        # 3. Finally delete the client
         cursor.execute("DELETE FROM clients WHERE id = %s", (id,))
         conn.commit()
 
         return jsonify({
             "id": id,
-            "message": "Client deleted successfully!"
+            "message": "Client and all associated requirements deleted successfully!"
         }), 200
 
-    except Error as e:
-        return jsonify({"message": str(e)}), 500
+    except Exception as e:
+        conn.rollback()
+        print(f"❌ Error deleting client: {e}")
+        return jsonify({"message": "Error deleting client", "error": str(e)}), 500
 
     finally:
         cursor.close()
@@ -1814,7 +2222,15 @@ def get_users_list():
     try:
         conn = get_db_connection()
         cursor = conn.cursor(dictionary=True)
-        cursor.execute("SELECT id, name, email, phone, role, status FROM users ORDER BY id DESC")
+        
+        # EXCLUDE Srini Admin (srini@thinqorsolutions.com) from list
+        # We can filter by email or specific ID if known, email is safer/readable
+        cursor.execute("""
+            SELECT id, name, email, phone, role, status 
+            FROM users 
+            WHERE email != 'srini@thinqorsolutions.com'
+            ORDER BY id DESC
+        """)
         users = cursor.fetchall()
         cursor.close()
         conn.close()
@@ -1877,9 +2293,19 @@ def add_user():
 # -------------------------------
 # Update a user
 # -------------------------------
+# -------------------------------
+# Update a user
+# -------------------------------
 @app.route("/update-user/<int:id>", methods=["PUT"])
 def update_user(id):
     try:
+        # Securely identify requester
+        requester = get_current_user()
+        if not requester:
+            return jsonify({"message": "❌ Unauthorized: Please login"}), 401
+            
+        requester_email = requester.get("email", "").lower()
+
         data = request.json
         password = data.get("password")  # optional
 
@@ -1910,6 +2336,23 @@ def update_user(id):
             conn.close()
             return jsonify({"message": "Name and email are required"}), 400
 
+        # ---------------- RBAC SECURITY CHECK ----------------
+        target_email = existing.get("email", "").lower()
+        target_role = existing.get("role")
+        
+        # Rule 1: NO ONE can edit Srini Admin via this generic route
+        if target_email == "srini@thinqorsolutions.com":
+             cursor.close()
+             conn.close()
+             return jsonify({"message": "⛔ Security Violation: Cannot modify Main Admin account."}), 403
+
+        # Rule 2: If target is ADMIN, only Srini can edit.
+        if target_role == "ADMIN":
+             if requester_email != "srini@thinqorsolutions.com":
+                 cursor.close()
+                 conn.close()
+                 return jsonify({"message": "⛔ Permission Denied: Only Main Admin can edit other Admins."}), 403
+ 
         update_values = [name, email, phone, role, status, id]
 
         if password:
@@ -1940,8 +2383,70 @@ def update_user(id):
 @app.route("/delete-user/<int:id>", methods=["DELETE"])
 def delete_user(id):
     try:
+        # Securely identify requester
+        requester = get_current_user()
+        if not requester:
+            return jsonify({"message": "❌ Unauthorized: Please login"}), 401
+            
+        requester_email = requester.get("email", "").lower()
+
         conn = get_db_connection()
-        cursor = conn.cursor()
+        cursor = conn.cursor(dictionary=True)
+        
+        cursor.execute("SELECT email, role FROM users WHERE id=%s", (id,))
+        target_user = cursor.fetchone()
+        
+        if not target_user:
+            cursor.close()
+            conn.close()
+            return jsonify({"message": "User not found"}), 404
+            
+        target_email = target_user['email'].lower()
+        target_role = target_user['role']
+        
+        # Rule 1: Cannot delete Srini
+        if target_email == "srini@thinqorsolutions.com":
+            cursor.close()
+            conn.close()
+            return jsonify({"message": "⛔ Security Violation: Cannot delete Main Admin."}), 403
+            
+        # Rule 2: If target is ADMIN, only Srini can delete
+        if target_role == "ADMIN":
+            if requester_email != "srini@thinqorsolutions.com":
+                cursor.close()
+                conn.close()
+                return jsonify({"message": "⛔ Permission Denied: Only Main Admin can delete other Admins."}), 403
+                
+        # Proceed with delete
+        
+        # 3. Handle FK Constraints: Reassign ownership to the Admin deleting the user
+        print(f"DEBUG: requester={requester}")
+        
+        try:
+            requester_id = int(requester.get("id"))
+        except (ValueError, TypeError):
+            # Fallback if ID is invalid (should not happen with token auth)
+            print(f"❌ Error: Invalid requester ID: {requester.get('id')}")
+            # Try to look up ID by email
+            conn = get_db_connection()
+            c2 = conn.cursor()
+            c2.execute("SELECT id FROM users WHERE email=%s", (requester_email,))
+            row = c2.fetchone()
+            c2.close()
+            conn.close()
+            if row:
+                requester_id = row[0]
+            else:
+                 return jsonify({"message": "❌ Error: Could not verify requester ID for reassignment."}), 500
+
+        # Reassign candidates created by this user
+        cursor.execute("UPDATE candidates SET created_by = %s WHERE created_by = %s", (requester_id, id))
+        
+        # Reassign requirements created by this user
+        # Safe cast to string because created_by in requirements is VARCHAR
+        cursor.execute("UPDATE requirements SET created_by = %s WHERE created_by = %s", (str(requester_id), str(id)))
+        
+        # Delete user
         cursor.execute("DELETE FROM users WHERE id=%s", (id,))
         conn.commit()
         cursor.close()
@@ -2020,91 +2525,53 @@ def get_reports_stats():
     except Exception as e:
         print(f"❌ Error fetching report stats: {e}")
         return jsonify({"error": str(e)}), 500
-# ----------------------------
-# Get all stages
-# ----------------------------
-@app.route("/api/stages", methods=["GET"])
-def get_stages():
-    conn = get_db_connection()
-    if not conn:
-        return jsonify({"error": "Database connection failed"}), 500
-    cursor = conn.cursor()
-    try:
-        cursor.execute("SELECT stage_name FROM tracker_stages ORDER BY stage_order ASC")
-        stages = [row[0] for row in cursor.fetchall()]
-        return jsonify(stages), 200
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-    finally:
-        cursor.close()
-        conn.close()
 
-# ----------------------------
-# Get candidate progress
-# ----------------------------
+
+
 @app.route("/api/candidate_progress", methods=["GET"])
-def candidate_progress():
+def get_candidate_progress():
     conn = get_db_connection()
     if not conn:
         return jsonify({"error": "Database connection failed"}), 500
-    cursor = conn.cursor(dictionary=True)
+
     try:
-        stages_param = request.args.get("stages")
-        if stages_param:
-            stages = tuple(stage.strip() for stage in stages_param.split(","))
-        else:
-            stages = None
+        cursor = conn.cursor(dictionary=True)
 
         sql = """
-            SELECT cp.id, cp.candidate_id, c.name AS candidate_name,
-                   cp.requirement_id, cp.category, cp.current_stage,
-                   cp.status, cp.manual_decision, cp.updated_at
+            SELECT cp.id, cp.candidate_id, cp.requirement_id, cp.stage_name,
+                   cp.status, c.name AS candidate_name,
+                   rs.stage_name
             FROM candidate_progress cp
             LEFT JOIN candidates c ON cp.candidate_id = c.id
-            WHERE cp.status IN ('PENDING', 'IN_PROGRESS', 'COMPLETED')
+            LEFT JOIN requirement_stages rs ON cp.stage_id = rs.id
+            WHERE cp.id IN (
+                SELECT MAX(id)
+                FROM candidate_progress
+                GROUP BY candidate_id
+            )
+            ORDER BY cp.id
         """
-        if stages:
-            placeholders = ",".join(["%s"] * len(stages))
-            sql += f" AND cp.current_stage IN ({placeholders})"
-            cursor.execute(sql, stages)
-        else:
-            cursor.execute(sql)
 
+        cursor.execute(sql)
         rows = cursor.fetchall()
         return jsonify(rows), 200
+
     except Exception as e:
+        print("Error fetching candidate progress:", e)
         return jsonify({"error": str(e)}), 500
+
     finally:
         cursor.close()
         conn.close()
 
-# ----------------------------
-# Update candidate stage
-# ----------------------------
-@app.route("/api/update_stage/<int:progress_id>", methods=["PUT"])
-def update_stage(progress_id):
-    conn = get_db_connection()
-    if not conn:
-        return jsonify({"error": "Database connection failed"}), 500
-    cursor = conn.cursor()
-    try:
-        data = request.json
-        new_stage = data.get("new_stage")
-        if not new_stage:
-            return jsonify({"error": "new_stage is required"}), 400
+# -------------------------------------
+# Serve Resumes
+# -------------------------------------
+@app.route('/uploads/resumes/<filename>')
+def uploaded_file(filename):
+    return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
 
-        # Update the candidate_progress
-        cursor.execute(
-            "UPDATE candidate_progress SET current_stage=%s WHERE id=%s",
-            (new_stage, progress_id)
-        )
-        conn.commit()
-        return jsonify({"message": "Stage updated successfully"}), 200
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-    finally:
-        cursor.close()
-        conn.close()
+
 
 # -------------------------------------
 # Run Server
@@ -2121,4 +2588,4 @@ if __name__ == '__main__':
     register_ai_routes(app)
     app.register_blueprint(jd_bp)
     app.register_blueprint(screening_bp)
-    app.run(debug=True)
+    app.run(debug=True, port=5001)

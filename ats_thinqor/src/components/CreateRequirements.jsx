@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from "react";
 import { useSelector, useDispatch } from "react-redux";
-import { createRequirement, fetchClients } from "../auth/authSlice";
+import { createRequirement, fetchClients, autoFillRequirement } from "../auth/authSlice";
+import { toPascalCase } from "../utils/stringUtils";
 
 export default function CreateRequirements() {
   const dispatch = useDispatch();
@@ -19,6 +20,7 @@ export default function CreateRequirements() {
     skills_required: "",
     experience_required: "",
     ctc_range: "",
+    amount:0,
     no_of_rounds: 1,
   });
 
@@ -34,32 +36,26 @@ export default function CreateRequirements() {
     setAiError(null);
 
     try {
-      const res = await fetch("http://127.0.0.1:5000/api/ai/jd-to-requirement", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ jd_text: jdText }),
-      });
+      const resultAction = await dispatch(autoFillRequirement(jdText));
 
-      const data = await res.json();
-
-      if (data.error) {
-        setAiError(data.error);
-        return alert("AI Error: " + data.error);
-      }
-
-      if (data.suggested_requirement) {
-        // Removed ectc mapping
-        setForm(prev => ({
-          ...prev,
-          title: data.suggested_requirement.title || prev.title,
-          location: data.suggested_requirement.location || prev.location,
-          skills_required: data.suggested_requirement.skills_required || prev.skills_required,
-          experience_required: data.suggested_requirement.experience_required || prev.experience_required,
-          ctc_range: data.suggested_requirement.ctc_range || prev.ctc_range,
-          description: data.suggested_requirement.description || prev.description,
-        }));
-
-        alert("AI Auto-fill complete!");
+      if (autoFillRequirement.fulfilled.match(resultAction)) {
+        const data = resultAction.payload;
+        if (data.suggested_requirement) {
+          setForm(prev => ({
+            ...prev,
+            title: data.suggested_requirement.title || prev.title,
+            location: data.suggested_requirement.location || prev.location,
+            skills_required: data.suggested_requirement.skills_required || prev.skills_required,
+            experience_required: data.suggested_requirement.experience_required || prev.experience_required,
+            ctc_range: data.suggested_requirement.ctc_range || prev.ctc_range,
+            description: data.suggested_requirement.description || prev.description,
+            amount:data.amount
+          }));
+          alert("AI Auto-fill complete!");
+        }
+      } else {
+        setAiError(resultAction.payload || "AI Auto-fill failed");
+        alert("AI Error: " + (resultAction.payload || "Unknown error"));
       }
     } catch (err) {
       setAiError(err.message);
@@ -84,16 +80,30 @@ export default function CreateRequirements() {
     );
   }
 
+  // ... imports
+
   // ---------------- FORM HANDLERS ----------------
   const handleChange = (e) => {
     const { name, value } = e.target;
-    setForm({ ...form, [name]: value });
+
+    let finalValue = value;
+    // Auto-format title and location to PascalCase
+    if (["title", "location", "skills_required"].includes(name)) {
+      finalValue = toPascalCase(value);
+    }
+
+    setForm({ ...form, [name]: finalValue });
 
     // Update stage names array when no_of_rounds changes
     if (name === "no_of_rounds") {
-      const rounds = parseInt(value) || 1;
+      let rounds = parseInt(value);
+      if (isNaN(rounds) || rounds < 1) rounds = 1;
+      if (rounds > 10) rounds = 10; // Cap at 10
+
+      // Adjust stageNames array size while creating new array to avoid mutation issues
       const newStageNames = [];
       for (let i = 0; i < rounds; i++) {
+        // Preserve existing names if available, else default
         newStageNames.push(stageNames[i] || `Round ${i + 1}`);
       }
       setStageNames(newStageNames);
@@ -109,9 +119,16 @@ export default function CreateRequirements() {
   const handleSubmit = (e) => {
     e.preventDefault();
 
-    // Include stage names in payload
+    // Extra validation for mandatory fields just in case
+    if (!form.skills_required || !form.experience_required || !form.ctc_range) {
+      alert("Please fill all mandatory fields: Skills, Experience, CTC.");
+      return;
+    }
+
+    // Include stage names in payload and ensure amount is a number
     const payload = {
       ...form,
+      amount: parseFloat(form.amount) || 0,
       created_by: user?.role || "",
       stage_names: stageNames
     };
@@ -129,6 +146,7 @@ export default function CreateRequirements() {
           skills_required: "",
           experience_required: "",
           ctc_range: "",
+          amount:0,
           no_of_rounds: 1,
         });
         setStageNames(["Round 1"]);
@@ -195,22 +213,54 @@ export default function CreateRequirements() {
         <input name="location" placeholder="Location" className="border p-2 rounded"
           value={form.location} onChange={handleChange} required />
 
-        <input name="experience_required" placeholder="Experience (years)" className="border p-2 rounded"
-          value={form.experience_required} onChange={handleChange} />
+        <input
+          name="experience_required"
+          placeholder="Experience (years)"
+          className="border p-2 rounded"
+          value={form.experience_required}
+          onChange={handleChange}
+          required
+        />
 
         <textarea
           name="description"
-          placeholder="Job Description (Optional)"
+          placeholder="Job Description (Required)"
           value={form.description}
           onChange={handleChange}
           className="border p-2 rounded col-span-2 h-24"
+          required
         />
 
-        <input name="experience_required" placeholder="Experience (years)" value={form.experience_required} onChange={handleChange} className="border p-2 rounded" />
-        <input name="skills_required" placeholder="Skills (comma separated)" value={form.skills_required} onChange={handleChange} className="border p-2 rounded" />
+        <input
+          name="skills_required"
+          placeholder="Skills (comma separated)"
+          value={form.skills_required}
+          onChange={handleChange}
+          className="border p-2 rounded"
+          required
+        />
 
-        <input name="ctc_range" placeholder="CTC Range" value={form.ctc_range} onChange={handleChange} className="border p-2 rounded" />
+        <input
+          name="ctc_range"
+          placeholder="CTC Range"
+          value={form.ctc_range}
+          onChange={handleChange}
+          className="border p-2 rounded"
+          required
+        />
 
+        <input 
+          name="amount"
+          type="number"
+          min="0"
+          step="0.01"
+          placeholder="Amount per person"
+          value={form.amount || ""}
+          onChange={handleChange}
+          className="border p-2 rounded"
+          required
+        />
+        
         <input
           name="no_of_rounds"
           type="number"
@@ -240,12 +290,14 @@ export default function CreateRequirements() {
                     onChange={(e) => handleStageNameChange(index, e.target.value)}
                     placeholder={`e.g., Technical Round, HR Round`}
                     className="flex-1 border p-2 rounded text-sm"
+                    maxLength={50}
+                    required
                   />
                 </div>
               ))}
             </div>
             <p className="text-xs text-gray-500 mt-2">
-              💡 These stage names will be used for candidate tracking
+              💡 These stage names will be used for candidate tracking. Max 50 characters.
             </p>
           </div>
         )}
